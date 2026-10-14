@@ -17,6 +17,7 @@ package io.agentscope.harness.agent.gateway;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.Field;
@@ -25,8 +26,12 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 import org.junit.jupiter.api.Test;
 
 /** Unit tests for {@link LocalSessionTurnGate} fair per-key mutual exclusion. */
@@ -214,6 +219,102 @@ class LocalSessionTurnGateTest {
 
         assertTrue(errors.isEmpty(), errors.toString());
         assertEquals(1, maxInside.get(), "at most one holder per key, even under heavy churn");
+    }
+
+    @Test
+    void preInterruptedAcquireDoesNotRetainAnIdleKey() throws Exception {
+        LocalSessionTurnGate gate = new LocalSessionTurnGate();
+        try {
+            Thread.currentThread().interrupt();
+            assertThrows(InterruptedException.class, () -> gate.acquire("interrupted"));
+        } finally {
+            Thread.interrupted();
+        }
+        assertTrue(internalGates(gate).isEmpty());
+        try (TurnLease ignored = gate.acquire("interrupted")) {
+            assertTrue(gate.isRunning("interrupted"));
+        }
+        assertTrue(internalGates(gate).isEmpty());
+    }
+
+    @Test
+    void interruptedWaiterRetiresWithoutRemovingTheHolderOrOtherWaiter() throws Exception {
+        LocalSessionTurnGate gate = new LocalSessionTurnGate();
+        String key = "interrupted-waiter";
+        TurnLease holder = gate.acquire(key);
+        Object entry = internalGates(gate).get(key);
+        Field semaphoreField = entry.getClass().getDeclaredField("semaphore");
+        semaphoreField.setAccessible(true);
+        Semaphore semaphore = (Semaphore) semaphoreField.get(entry);
+        AtomicBoolean interrupted = new AtomicBoolean();
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        CountDownLatch survivorAcquired = new CountDownLatch(1);
+        CountDownLatch releaseSurvivor = new CountDownLatch(1);
+
+        Thread cancelled =
+                new Thread(
+                        () -> {
+                            try (TurnLease ignored = gate.acquire(key)) {
+                                error.compareAndSet(
+                                        null,
+                                        new AssertionError("cancelled waiter acquired the gate"));
+                            } catch (InterruptedException expected) {
+                                interrupted.set(true);
+                            } catch (Throwable failure) {
+                                error.compareAndSet(null, failure);
+                            }
+                        });
+        Thread survivor =
+                new Thread(
+                        () -> {
+                            try (TurnLease ignored = gate.acquire(key)) {
+                                survivorAcquired.countDown();
+                                if (!releaseSurvivor.await(5, TimeUnit.SECONDS)) {
+                                    throw new AssertionError("surviving holder was not released");
+                                }
+                            } catch (Throwable failure) {
+                                error.compareAndSet(null, failure);
+                            }
+                        });
+        try {
+            cancelled.start();
+            awaitQueueLength(semaphore, 1);
+            survivor.start();
+            awaitQueueLength(semaphore, 2);
+            cancelled.interrupt();
+            cancelled.join(5000);
+            assertFalse(cancelled.isAlive());
+            assertTrue(interrupted.get());
+            assertEquals(1, internalGates(gate).size());
+            assertTrue(gate.isRunning(key));
+            assertEquals(1, survivorAcquired.getCount(), "the original holder is still active");
+
+            holder.close();
+            assertTrue(survivorAcquired.await(5, TimeUnit.SECONDS));
+            assertTrue(gate.isRunning(key));
+            releaseSurvivor.countDown();
+            survivor.join(5000);
+            assertFalse(survivor.isAlive());
+            assertEquals(null, error.get());
+            assertFalse(gate.isRunning(key));
+            assertTrue(
+                    internalGates(gate).isEmpty(), "all holder and waiter references must retire");
+        } finally {
+            holder.close();
+            releaseSurvivor.countDown();
+            cancelled.interrupt();
+            survivor.interrupt();
+            cancelled.join(5000);
+            survivor.join(5000);
+        }
+    }
+
+    private static void awaitQueueLength(Semaphore semaphore, int expected) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (semaphore.getQueueLength() != expected && System.nanoTime() < deadline) {
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
+        }
+        assertEquals(expected, semaphore.getQueueLength(), "waiters must reach the semaphore");
     }
 
     private static ConcurrentHashMap<?, ?> internalGates(LocalSessionTurnGate gate)
