@@ -24,14 +24,18 @@ import io.agentscope.core.message.ContentBlock;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.MsgRole;
 import io.agentscope.core.message.TextBlock;
+import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.model.ChatModelBase;
 import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.model.GenerateOptions;
 import io.agentscope.core.model.ModelRegistry;
 import io.agentscope.core.model.ToolSchema;
 import io.agentscope.core.state.InMemoryAgentStateStore;
+import io.agentscope.core.tool.Tool;
+import io.agentscope.core.tool.Toolkit;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -93,6 +97,120 @@ class ReActAgentPerCallModelTest {
                 .model(defaultModel)
                 .stateStore(new InMemoryAgentStateStore())
                 .build();
+    }
+
+    private static final class ToolRoundModel extends ChatModelBase {
+        private final AtomicInteger calls = new AtomicInteger();
+
+        @Override
+        public String getModelName() {
+            return "original";
+        }
+
+        @Override
+        protected Flux<ChatResponse> doStream(
+                List<Msg> messages, List<ToolSchema> tools, GenerateOptions options) {
+            ContentBlock block =
+                    calls.incrementAndGet() == 1
+                            ? ToolUseBlock.builder()
+                                    .id("change-1")
+                                    .name("between_rounds")
+                                    .input(Map.of())
+                                    .build()
+                            : TextBlock.builder().text("original answer").build();
+            return Flux.just(ChatResponse.builder().content(List.of(block)).build());
+        }
+    }
+
+    public static final class BetweenRoundsTool {
+        private final Runnable action;
+
+        BetweenRoundsTool(Runnable action) {
+            this.action = action;
+        }
+
+        @Tool(name = "between_rounds", description = "Perform an action between model rounds")
+        public String perform() {
+            action.run();
+            return "done";
+        }
+    }
+
+    private ReActAgent toolAgent(Runnable betweenRounds) {
+        Toolkit toolkit = new Toolkit();
+        toolkit.registerTool(new BetweenRoundsTool(betweenRounds));
+        return ReActAgent.builder()
+                .name("asst")
+                .model(new CountingModel("default"))
+                .toolkit(toolkit)
+                .stateStore(new InMemoryAgentStateStore())
+                .build();
+    }
+
+    private RuntimeContext selectedContext(String session) {
+        return RuntimeContext.builder()
+                .userId("u1")
+                .sessionId(session)
+                .modelId("test:turn")
+                .build();
+    }
+
+    @Test
+    void registryReplacementBetweenToolRoundsDoesNotChangeInFlightSelection() {
+        ToolRoundModel original = new ToolRoundModel();
+        CountingModel replacement = new CountingModel("replacement");
+        ModelRegistry.register("test:turn", original);
+        try {
+            ReActAgent agent = toolAgent(() -> ModelRegistry.register("test:turn", replacement));
+            Msg result =
+                    agent.call(List.of(userMsg("hello")), selectedContext("in-flight"))
+                            .block(Duration.ofSeconds(10));
+            assertEquals(2, original.calls.get(), "one run must retain its selected model");
+            assertEquals(0, replacement.streamCount(), "replacement applies only to a later run");
+            assertEquals("original answer", result.getTextContent());
+        } finally {
+            ModelRegistry.reset();
+        }
+    }
+
+    @Test
+    void aLaterRunSeesTheReplacementRegisteredDuringThePreviousRun() {
+        ToolRoundModel original = new ToolRoundModel();
+        CountingModel replacement = new CountingModel("replacement");
+        ModelRegistry.register("test:turn", original);
+        try {
+            ReActAgent agent = toolAgent(() -> ModelRegistry.register("test:turn", replacement));
+            agent.call(List.of(userMsg("hello")), selectedContext("first"))
+                    .block(Duration.ofSeconds(10));
+            int before = replacement.streamCount();
+            int originalBefore = original.calls.get();
+            Msg result =
+                    agent.call(List.of(userMsg("hello again")), selectedContext("second"))
+                            .block(Duration.ofSeconds(10));
+            assertEquals(before + 1, replacement.streamCount());
+            assertEquals(originalBefore, original.calls.get());
+            assertEquals("ok", result.getTextContent());
+        } finally {
+            ModelRegistry.reset();
+        }
+    }
+
+    @Test
+    void aStableRegistryUsesTheSelectedModelForBothToolRounds() {
+        ToolRoundModel original = new ToolRoundModel();
+        AtomicInteger toolCalls = new AtomicInteger();
+        ModelRegistry.register("test:turn", original);
+        try {
+            ReActAgent agent = toolAgent(toolCalls::incrementAndGet);
+            Msg result =
+                    agent.call(List.of(userMsg("hello")), selectedContext("stable"))
+                            .block(Duration.ofSeconds(10));
+            assertEquals(2, original.calls.get());
+            assertEquals(1, toolCalls.get());
+            assertEquals("original answer", result.getTextContent());
+        } finally {
+            ModelRegistry.reset();
+        }
     }
 
     @Test
