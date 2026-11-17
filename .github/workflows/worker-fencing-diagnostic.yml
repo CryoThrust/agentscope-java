@@ -1,0 +1,59 @@
+name: Worker fencing Windows diagnostic
+
+on:
+  push:
+    branches:
+      - diagnostics/worker-fencing-windows-20261117
+
+permissions:
+  contents: read
+
+jobs:
+  unchanged-source:
+    name: Windows worker tests (${{ matrix.revision.name }})
+    runs-on: windows-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        revision:
+          - name: base
+            sha: 5525ac1aa09e597042a259d581c51807e89bb0f5
+          - name: recall-head
+            sha: 266c6551e3b1bb823452b4c85cc3284fb326b655
+    steps:
+      - name: Enable long paths
+        run: git config --system core.longpaths true
+      - uses: actions/checkout@v4
+        with:
+          repository: agentscope-ai/agentscope-java
+          ref: ${{ matrix.revision.sha }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Record source revision
+        run: git rev-parse HEAD
+      - name: Repeat unchanged WorkerRuntimeTest
+        shell: pwsh
+        run: |
+          $diagnosticFailed = $false
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            Write-Output "WorkerRuntimeTest attempt $attempt on ${{ matrix.revision.sha }}"
+            & mvn -B -T1C '-pl' 'agentscope-durable/durable-worker' '-am' '-Dtest=WorkerRuntimeTest' '-Dsurefire.failIfNoSpecifiedTests=false' '-Dmaven.javadoc.skip=true' '-Dmaven.source.skip=true' '-Djacoco.skip=true' '-DskipDurableWindowsTests=true' test
+            if ($LASTEXITCODE -ne 0) { $diagnosticFailed = $true }
+            $reportDirectory = "diagnostic-reports/attempt-$attempt"
+            New-Item -ItemType Directory -Force -Path $reportDirectory | Out-Null
+            Get-ChildItem -Path . -Directory -Recurse -Filter surefire-reports | ForEach-Object {
+              $moduleName = $_.Parent.Parent.Name
+              Copy-Item -Path $_.FullName -Destination "$reportDirectory/$moduleName" -Recurse -Force
+            }
+          }
+          if ($diagnosticFailed) { exit 1 }
+      - name: Upload all attempt reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-fencing-${{ matrix.revision.name }}
+          path: diagnostic-reports
+          if-no-files-found: warn
