@@ -1,0 +1,106 @@
+name: Process recovery Linux diagnostic
+
+on:
+  push:
+    branches:
+      - diagnostics/process-recovery-linux-20261117
+
+permissions:
+  contents: read
+
+jobs:
+  unchanged-source:
+    name: Linux recovery (${{ matrix.revision.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        revision:
+          - name: base
+            sha: 30dc84b59e646f443dcf1870d66b3225e6210582
+          - name: interop-head
+            sha: d5afe9eb1b8d895fd2478482c41d75171e5fc842
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: agentscope-ai/agentscope-java
+          ref: ${{ matrix.revision.sha }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: recovery-linux-${{ matrix.revision.name }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            maven-Linux-
+      - name: Record environment and unchanged sources
+        run: |
+          git rev-parse HEAD
+          git status --short
+          uname -a
+          java -version
+          mvn -version
+          nproc
+      - name: Original full Linux PR build
+        id: full
+        continue-on-error: true
+        run: |
+          mvn -B -T1C -Dmaven.javadoc.skip=true -Dmaven.source.skip=true \
+            -Djunit.jupiter.tempdir.cleanup.mode.default=ON_SUCCESS clean verify
+      - name: Preserve full build reports
+        if: always()
+        run: |
+          mkdir -p diagnostic-reports/full
+          while IFS= read -r -d '' report; do
+            report_target="diagnostic-reports/full/${report#./}"
+            mkdir -p "$(dirname "$report_target")"
+            cp -R "$report" "$report_target"
+          done < <(find . -type d -name surefire-reports -not -path './diagnostic-reports/*' -print0)
+      - name: Repeat unchanged recovery tests
+        id: focused
+        if: always()
+        continue-on-error: true
+        run: |
+          diagnostic_failed=0
+          for attempt in 1 2 3 4 5; do
+            echo "ProcessRecoveryTest attempt $attempt at ${{ matrix.revision.sha }}"
+            if ! mvn -B -T1C \
+              -pl agentscope-durable/durable-adapters/durable-adapter-harness-agentscope -am \
+              -Dtest=ProcessRecoveryTest -Dsurefire.failIfNoSpecifiedTests=false \
+              -Dmaven.javadoc.skip=true -Dmaven.source.skip=true \
+              -Djunit.jupiter.tempdir.cleanup.mode.default=ON_SUCCESS test; then
+              diagnostic_failed=1
+            fi
+            report_target="diagnostic-reports/attempt-$attempt"
+            mkdir -p "$report_target"
+            cp -R agentscope-durable/durable-adapters/durable-adapter-harness-agentscope/target/surefire-reports \
+              "$report_target/" || diagnostic_failed=1
+          done
+          exit "$diagnostic_failed"
+      - name: Preserve failed process fixtures
+        if: always()
+        run: |
+          mkdir -p diagnostic-reports/process-fixtures
+          while IFS= read -r -d '' marker; do
+            fixture_directory="$(dirname "$(dirname "$marker")")"
+            cp -R "$fixture_directory" diagnostic-reports/process-fixtures/
+          done < <(find /tmp -type f -path '*/sandbox/model-calls' -print0 2>/dev/null)
+      - name: Upload reports and failed process fixtures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: process-recovery-${{ matrix.revision.name }}
+          path: diagnostic-reports
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve any failed outcome
+        if: always()
+        env:
+          FULL_OUTCOME: ${{ steps.full.outcome }}
+          FOCUSED_OUTCOME: ${{ steps.focused.outcome }}
+        run: |
+          test "$FULL_OUTCOME" = success
+          test "$FOCUSED_OUTCOME" = success
